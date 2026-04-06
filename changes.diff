@@ -1,0 +1,2412 @@
+diff -ruN '--exclude=*.o' '--exclude=*.ko' '--exclude=*.cmd' '--exclude=*.mod' '--exclude=*.mod.c' '--exclude=Module.symvers' '--exclude=modules.order' /mnt/data/ads131m08_work/src/README_PATCHED.md /mnt/data/ads131m08_patched_src/README_PATCHED.md
+--- /mnt/data/ads131m08_work/src/README_PATCHED.md	1970-01-01 00:00:00.000000000 +0000
++++ /mnt/data/ads131m08_patched_src/README_PATCHED.md	2026-03-30 01:31:41.079648120 +0000
+@@ -0,0 +1,39 @@
++# ADS131M08 patched driver notes
++
++This package contains a patched version of the original driver focused on stability and streaming reliability on Raspberry Pi CM5 / Raspberry Pi OS Bookworm.
++
++## Main changes
++
++- Removed unsafe shared `spin_lock_irqsave()` flag storage from the custom list and chunk buffer code.
++- Switched DRDY/RST handling from hard-coded global GPIO numbers to descriptor-based GPIOs (`drdy-gpios`, `reset-gpios`) taken from Device Tree.
++- Fixed the blocking read path to wait on the actual ready-queue state instead of a global condition flag.
++- Made the char device single-open logic race-safe with `atomic_cmpxchg()`.
++- Blocked destructive SPI control ioctls while continuous sampling is running to avoid protocol collisions.
++- Added SPI transfer serialization with a mutex.
++- Fixed SPI error paths so transfer buffers are always returned.
++- Increased the number of chunk buffers from 3 to 8 to reduce overrun pressure.
++- When no chunk buffer is available, the IRQ thread now performs a discard read to keep the ADC/SPI frame stream aligned and increments a drop counter.
++- Added drop counter visibility to `/proc/ads131m08`.
++- `RESET` now clocks a full-length frame instead of an undersized one.
++- Probe/remove cleanup paths were tightened up and now call `ads131m08_spi_exit()`.
++- The driver now respects the SPI speed supplied by Device Tree unless it is absent.
++
++## Device Tree expectation
++
++The driver now expects these DT properties on the SPI device node:
++
++- `drdy-gpios`
++- `reset-gpios`
++
++Example values are already added to the provided DTS overlay files.
++
++## Notes
++
++- The package is source-only; previous build artifacts were removed from the release tarball.
++- I did not add DMA in this revision.
++- I also did not redesign the driver around `spi_async()` yet; this patch keeps the current synchronous data path but removes the most obvious correctness issues first.
++
++## Build sanity check
++
++- Compiled successfully in the container against Linux 6.12.69 headers as a syntax/API sanity check.
++- Target runtime remains Raspberry Pi CM5 / 6.6.51, so you should still rebuild on-target or against the exact Pi kernel headers.
+diff -ruN '--exclude=*.o' '--exclude=*.ko' '--exclude=*.cmd' '--exclude=*.mod' '--exclude=*.mod.c' '--exclude=Module.symvers' '--exclude=modules.order' /mnt/data/ads131m08_work/src/ads131m08.dts /mnt/data/ads131m08_patched_src/ads131m08.dts
+--- /mnt/data/ads131m08_work/src/ads131m08.dts	2025-04-22 00:08:13.000000000 +0000
++++ /mnt/data/ads131m08_patched_src/ads131m08.dts	2026-03-30 01:30:05.455598083 +0000
+@@ -1,6 +1,8 @@
+ /dts-v1/;
+ /plugin/;
+ 
++#include <dt-bindings/gpio/gpio.h>
++
+ / {
+     compatible = "brcm,bcm2711";
+ 
+@@ -15,7 +17,9 @@
+             ads131m08: ads131m08@0 {
+                 compatible = "ti,ads131m08";
+                 reg = <0>;
+-                spi-max-frequency = <1000000>;
++                spi-max-frequency = <15000000>;
++                drdy-gpios = <&gpio 18 GPIO_ACTIVE_HIGH>;
++                reset-gpios = <&gpio 16 GPIO_ACTIVE_HIGH>;
+                 status = "okay";
+             };
+         };
+diff -ruN '--exclude=*.o' '--exclude=*.ko' '--exclude=*.cmd' '--exclude=*.mod' '--exclude=*.mod.c' '--exclude=Module.symvers' '--exclude=modules.order' /mnt/data/ads131m08_work/src/ads131m08.h /mnt/data/ads131m08_patched_src/ads131m08.h
+--- /mnt/data/ads131m08_work/src/ads131m08.h	2025-05-06 23:36:22.000000000 +0000
++++ /mnt/data/ads131m08_patched_src/ads131m08.h	2026-03-30 01:30:05.452274029 +0000
+@@ -21,6 +21,7 @@
+ #include <linux/device.h>
+ #include <linux/interrupt.h>
+ #include <linux/workqueue.h>
++#include <linux/gpio/consumer.h>
+ #include "list.h"
+ 
+ /*****************************************
+@@ -34,7 +35,7 @@
+ 
+ ///////////////////////////////////////////////////////////
+ enum
+-{  
++{
+    ADS131M08_CH0,
+    ADS131M08_CH1,
+    ADS131M08_CH2,
+@@ -79,15 +80,12 @@
+    smpl_data_t data[MAX_CHUNK_SZ];
+    int chunk_sz;
+    int idx;	// Data index
+-   //struct mutex lock;
+    spinlock_t lock;
+-   unsigned long flags;
+    void		*xfer;
+ } chunk_buf_t;
+-//#define	BUF_LOCK(buf)	mutex_lock(&buf->lock)
+-//#define	BUF_UNLOCK(buf)	mutex_unlock(&buf->lock)
+-#define		BUF_LOCK(buf)	spin_lock_irqsave(&buf->lock,buf->flags)
+-#define		BUF_UNLOCK(buf)	spin_unlock_irqrestore(&buf->lock,buf->flags)
++
++#define BUF_LOCK(buf)   spin_lock(&(buf)->lock)
++#define BUF_UNLOCK(buf) spin_unlock(&(buf)->lock)
+ 
+ typedef struct
+ {
+@@ -96,7 +94,9 @@
+    struct cdev cdev;
+    dev_t dev_num;
+    struct class *cl;
+-   uint32_t gpio_irq_no;
++   int gpio_irq_no;
++   struct gpio_desc *drdy_gpiod;
++   struct gpio_desc *reset_gpiod;
+ } ads131m08_data_t;
+ 
+ /*****************************************
+@@ -115,11 +115,10 @@
+ 
+ /// ads131m08_gpio.c, GPIO interrupt routine
+ extern int ads131m08_gpio_init(ads131m08_data_t *data);
+-		//	irqreturn_t (*isr)(int irq,void *data));
+ extern void ads131m08_gpio_exit(ads131m08_data_t *data);
+ extern void ads131m08_adc_rst(void);
+ extern void ads131m08_adc_sync(void);
+-extern void ads131m08_gpio_set_irq(ads131m08_data_t *data,
++extern int ads131m08_gpio_set_irq(ads131m08_data_t *data,
+ 				irqreturn_t (*isr)(int irq,void *data),
+ 				irqreturn_t (*isr_thread)(int irq,void *data));
+ extern void ads131m08_gpio_clr_irq(ads131m08_data_t *data);
+@@ -131,24 +130,19 @@
+ extern void ads131m08_iface_wakeup(void);
+ 
+ /// ads131m08_spi.c
+-extern void ads131m08_spi_init(struct spi_device *spi);
++extern int ads131m08_spi_init(struct spi_device *spi);
+ extern void ads131m08_spi_exit(void);
+ extern int ads131m08_cmd_unlock(void);
+ extern int ads131m08_cmd_lock(void);
+ extern int ads131m08_cmd_reset(void);
+ extern int ads131m08_cmd_wakeup(void);
+ extern int ads131m08_cmd_standby(void);
+-//extern int ads131m08_read_data(int32_t *data,uint16_t *status);
+ extern int ads131m08_read_data(chunk_buf_t *active_buf);
++extern int ads131m08_read_data_discard(void);
+ 
+ extern int ads131m08_reg_write(uint8_t start_addr,int cnt,uint16_t *reg_val);
+ extern int ads131m08_reg_read(uint8_t start_addr,int cnt,uint16_t *ret_reg);
+ extern int ads131m08_read_stat(uint16_t *status);
+-extern int ads131m08_cmd_standby(void);
+-extern int ads131m08_cmd_wakeup(void);
+-extern int ads131m08_cmd_reset(void);
+-extern int ads131m08_cmd_lock(void);
+-extern int ads131m08_cmd_unlock(void);
+ extern int ads131m08_read_data_async(void);
+ 
+ /// ads131m08_data.c
+@@ -157,7 +151,6 @@
+ extern irqreturn_t ads131m08_data_isr(int irq,void *data);
+ extern void ads131m08_data_resize_chunk_buf(int chunk_sz);
+ extern chunk_buf_t *ads131m08_data_get(void);
+-//extern void ads131m08_data_return(void *data);
+ extern void ads131m08_data_return(const void *data);
+ extern int ads131m08_data_get_chunk_sz(void);
+ 
+@@ -175,5 +168,4 @@
+ extern void ads131m08_chunk_buf_ready(chunk_buf_t *chunk_buf);
+ extern void ads131m08_chunk_buf_active(chunk_buf_t *chunk_buf);
+ 
+-#endif // __NLC_DEV_H
+-
++#endif // __ADS131M08_H
+diff -ruN '--exclude=*.o' '--exclude=*.ko' '--exclude=*.cmd' '--exclude=*.mod' '--exclude=*.mod.c' '--exclude=Module.symvers' '--exclude=modules.order' /mnt/data/ads131m08_work/src/ads131m08_data.c /mnt/data/ads131m08_patched_src/ads131m08_data.c
+--- /mnt/data/ads131m08_work/src/ads131m08_data.c	2025-05-06 23:37:40.000000000 +0000
++++ /mnt/data/ads131m08_patched_src/ads131m08_data.c	2026-03-30 01:30:05.453800695 +0000
+@@ -22,11 +22,12 @@
+ #include <linux/delay.h>
+ #include <linux/atomic.h>
+ #include <linux/irq_work.h>
++#include <linux/ratelimit.h>
+ 
+ #include "ads131m08.h"
+ #include "list.h"
+ ///////////////////////////////////////////////////////////////////////
+-#define	CHUNK_BUF_CNT		3
++#define	CHUNK_BUF_CNT		8
+ ads131m08_data_t        *ads131m08_data;
+ struct device    *ads131m08_dev;
+ static list_t	*ready_list = NULL;
+@@ -40,30 +41,51 @@
+ //////////////////////////////////////////////////////////
+ // run_stat
+ static atomic_t run_stat;
++static atomic64_t drop_cnt;
++
+ int ads131m08_run_stat(void)
+-{  
++{
+    return atomic_read(&run_stat);
+ }
+ 
+ int ads131m08_run_cmd(int run)
+ {
+-   if(ads131m08_run_stat()==run)
+-   {
++   int ret;
++
++   if (ads131m08_run_stat() == run)
+       return SUCCESS;
+-   }
+ 
+-   if(run)
++   if (run)
+    {
+-      ads131m08_gpio_set_irq(ads131m08_data,ads131m08_isr,ads131m08_irq_thread);
+-      ads131m08_cmd_wakeup();
++      ads131m08_data_cleanup();
++      atomic_set(&run_stat, ADC_RUN);
++
++      ret = ads131m08_gpio_set_irq(ads131m08_data, ads131m08_isr, ads131m08_irq_thread);
++      if (ret < 0)
++      {
++         atomic_set(&run_stat, ADC_STOP);
++         return ret;
++      }
++
++      ret = ads131m08_cmd_wakeup();
++      if (ret < 0)
++      {
++         ads131m08_gpio_clr_irq(ads131m08_data);
++         atomic_set(&run_stat, ADC_STOP);
++         ads131m08_data_cleanup();
++         return ret;
++      }
+    }
+    else
+    {
+-      ads131m08_cmd_standby();
++      atomic_set(&run_stat, ADC_STOP);
+       ads131m08_gpio_clr_irq(ads131m08_data);
++      ret = ads131m08_cmd_standby();
+       ads131m08_data_cleanup();
++      if (ret < 0)
++         return ret;
+    }
+-   atomic_set(&run_stat,run);
++
+    return SUCCESS;
+ }
+ ///////////////////////////////////////////////////////////////////////////
+@@ -76,49 +98,49 @@
+ {
+    buf->chunk_sz = buf_sz;
+    buf->idx = 0;
++   buf->stat = BUF_STAT_FREE;
++   buf->xfer = NULL;
+    spin_lock_init(&buf->lock);
++   spin_lock_init(&buf->head.lock);
+ }
+ 
+ void ads131m08_data_resize_chunk_buf(int new_sz)
+ {
+    int i;
+    chunk_buf_t *buf;
+-   if(new_sz>MAX_CHUNK_SZ)
++
++   if (new_sz <= 0)
++      return;
++   if (new_sz > MAX_CHUNK_SZ)
+       new_sz = MAX_CHUNK_SZ;
+-   for(i=0;i<CHUNK_BUF_CNT;i++)
++
++   for (i = 0; i < CHUNK_BUF_CNT; i++)
+    {
+       buf = &chunk_buf_list[i];
+       BUF_LOCK(buf);
+       buf->chunk_sz = new_sz;
+-      buf->idx=0;
++      buf->idx = 0;
+       BUF_UNLOCK(buf);
+    }
+-   atomic_set(&chunk_sz,new_sz);
++   atomic_set(&chunk_sz, new_sz);
+ }
+ 
+ /////////////////////////////////////////////////////////////////////////////////////////
+-//static DEFINE_SPINLOCK(adc_lock);
+ static atomic_t	adc_lock;
+ 
+ static int ads131m08_adc_try_lock(void)
+ {
+-   if(atomic_read(&adc_lock)==false)
+-   {
+-      atomic_set(&adc_lock,true);
+-      return true;
+-   }
+-   return false;
++   return atomic_cmpxchg(&adc_lock, 0, 1) == 0;
+ }
+ 
+ int ads131m08_adc_lock_cnt(int cnt)
+ {
+    int i;
+-   for(i=0;i<cnt;i++)
++
++   for (i = 0; i < cnt; i++)
+    {
+-      if(ads131m08_adc_try_lock()==true)
+-      {
++      if (ads131m08_adc_try_lock())
+          return SUCCESS;
+-      }
+       udelay(1);
+    }
+    return FAIL;
+@@ -126,35 +148,40 @@
+ 
+ void ads131m08_adc_unlock(void)
+ {
+-   atomic_set(&adc_lock,false);
++   atomic_set(&adc_lock, 0);
+ }
++
+ void ads131m08_adc_lock_release(void)
+ {
+-   atomic_set(&adc_lock,false);
++   atomic_set(&adc_lock, 0);
+ }
+ ///////////////////////////////////////////////////////
+ smpl_data_t *ads131m08_smpl_data_get(chunk_buf_t *chunk_buf)
+ {
+-   smpl_data_t *data_list,*ret;
+-   data_list = chunk_buf->data;
++   smpl_data_t *ret;
++   int idx;
++
++   if (!chunk_buf)
++      return NULL;
++
+    BUF_LOCK(chunk_buf);
+-   ret = &data_list[chunk_buf->idx];
++   idx = chunk_buf->idx;
++   ret = &chunk_buf->data[idx];
+    BUF_UNLOCK(chunk_buf);
+    return ret;
+ }
+ 
+ void ads131m08_chunk_buf_ready(chunk_buf_t *chunk_buf)
+ {
+-   list_append(ready_list,chunk_buf);
+-   //wake_up_interruptible(&ads131m08_data->wq);
++   list_append(ready_list, chunk_buf);
+    ads131m08_iface_wakeup();
+ }
++
+ void ads131m08_chunk_buf_active(chunk_buf_t *chunk_buf)
+ {
+-   list_append(active_list,chunk_buf);
++   list_append(active_list, chunk_buf);
+ }
+ 
+-//static ktime_t smpl_ts;
+ static atomic64_t smpl_ts;
+ static irqreturn_t ads131m08_irq_thread(int irq,void *data)
+ {
+@@ -162,9 +189,17 @@
+    int ret;
+    smpl_data_t *new_data;
+ 
+-   if((active_buf=list_fetch(active_list))==NULL && 
+-      (active_buf=list_fetch(free_list))==NULL)
++   active_buf = list_fetch(active_list);
++   if (active_buf == NULL)
++      active_buf = list_fetch(free_list);
++
++   if (active_buf == NULL)
+    {
++      atomic64_inc(&drop_cnt);
++      ret = ads131m08_read_data_discard();
++      if (ret < 0)
++         pr_warn_ratelimited("%s:%s discard read failed, ret=%d\n",
++                             ads131m08_dev_name, __func__, ret);
+       return IRQ_HANDLED;
+    }
+ 
+@@ -173,72 +208,87 @@
+    BUF_UNLOCK(active_buf);
+ 
+    new_data = ads131m08_smpl_data_get(active_buf);
+-   new_data->ts = atomic64_read(&smpl_ts);
++   if (new_data)
++      new_data->ts = atomic64_read(&smpl_ts);
+ 
+-   if((ret=ads131m08_read_data(active_buf))<0)
++   ret = ads131m08_read_data(active_buf);
++   if (ret < 0)
+    {
+-      pr_err("%s:%s failed, ret=%d\n",ads131m08_dev_name,__func__,ret);
+-      ads131m08_chunk_buf_active(active_buf);	// return to active buf
++      pr_err("%s:%s failed, ret=%d\n", ads131m08_dev_name, __func__, ret);
++      ads131m08_chunk_buf_active(active_buf);
+    }
+    return IRQ_HANDLED;
+ }
+ 
+ static irqreturn_t ads131m08_isr(int irq,void *data)
+ {
+-   //set_cpus_allowed_ptr(current, cpumask_of(3));	// => panic 발생
+-   atomic64_set(&smpl_ts,ktime_get_real());
++   atomic64_set(&smpl_ts, ktime_get_real());
+    return IRQ_WAKE_THREAD;
+ }
+ 
+ chunk_buf_t *ads131m08_data_get(void)
+ {
+-   //return get_ready_buf();
+    return list_fetch(ready_list);
+ }
++
+ void ads131m08_data_return(const void *data)
+ {
+    chunk_buf_t *buf = (chunk_buf_t *)data;
++
++   if (!buf)
++      return;
++
+    BUF_LOCK(buf);
+-   buf->idx=0;
++   buf->idx = 0;
+    buf->stat = BUF_STAT_FREE;
++   buf->xfer = NULL;
+    BUF_UNLOCK(buf);
+-   list_append(free_list,buf);
++   list_append(free_list, buf);
+ }
++
+ int ads131m08_data_smpl_cnt(int *free_cnt,int *active_cnt)
+ {
+-   if(free_cnt)
++   if (free_cnt)
+       *free_cnt = list_get_cnt(free_list);
+-   if(active_cnt)
++   if (active_cnt)
+       *active_cnt = list_get_cnt(active_list);
+    return list_get_cnt(ready_list);
+ }
+ 
+ int ads131m08_data_buf_stat(char *print_buf)
+ {
+-   int i,idx=0,stat,b_idx;
++   int i, idx = 0, stat, b_idx;
+    chunk_buf_t *buf;
+-   idx = sprintf(print_buf,"RUN<%d>,OPEN<%d>,LIST_CNT:%d,%d,%d\n",
+-		ads131m08_run_stat(),
+-		ads131m08_open_stat(),
+-		list_get_cnt(free_list),
+-		list_get_cnt(ready_list),
+-		list_get_cnt(active_list));
+-   for(i=0;i<CHUNK_BUF_CNT;i++)
++
++   idx = sprintf(print_buf,
++                 "RUN<%d>,OPEN<%d>,LIST_CNT:%d,%d,%d,DROP:%lld\n",
++                 ads131m08_run_stat(),
++                 ads131m08_open_stat(),
++                 list_get_cnt(free_list),
++                 list_get_cnt(ready_list),
++                 list_get_cnt(active_list),
++                 atomic64_read(&drop_cnt));
++
++   for (i = 0; i < CHUNK_BUF_CNT; i++)
+    {
+       buf = &chunk_buf_list[i];
+       BUF_LOCK(buf);
+       stat = buf->stat;
+       b_idx = buf->idx;
+       BUF_UNLOCK(buf);
+-      idx+=sprintf(&print_buf[idx],"<%d> stat:%d,idx:%d,chunk_sz:%d\n",i+1,stat,b_idx,buf->chunk_sz);
++      idx += sprintf(&print_buf[idx], "<%d> stat:%d,idx:%d,chunk_sz:%d\n",
++                     i + 1, stat, b_idx, buf->chunk_sz);
+    }
+    return idx;
+ }
+ 
+ void ads131m08_data_cleanup(void)
+ {
+-   list_cleanup(ready_list,ads131m08_data_return);
+-   list_cleanup(active_list,ads131m08_data_return);
++   if (!ads131m08_data)
++      return;
++
++   list_cleanup(ready_list, ads131m08_data_return);
++   list_cleanup(active_list, ads131m08_data_return);
+    wake_up_interruptible(&ads131m08_data->wq);
+ }
+ 
+@@ -246,28 +296,43 @@
+ {
+    int i;
+    chunk_buf_t *buf;
+-   ads131m08_data = devm_kzalloc(&spi->dev,sizeof(ads131m08_data_t),GFP_KERNEL);
+-   if(!ads131m08_data)
++
++   ads131m08_data = devm_kzalloc(&spi->dev, sizeof(ads131m08_data_t), GFP_KERNEL);
++   if (!ads131m08_data)
+       return -ENOMEM;
+-   atomic_set(&chunk_sz,DEFAULT_CHUNK_SZ);
+-   atomic_set(&run_stat,FALSE);
++
++   atomic_set(&chunk_sz, DEFAULT_CHUNK_SZ);
++   atomic_set(&run_stat, 0);
++   atomic_set(&adc_lock, 0);
++   atomic64_set(&smpl_ts, 0);
++   atomic64_set(&drop_cnt, 0);
+    ads131m08_dev = &spi->dev;
++   ads131m08_data->spi = spi;
+    init_waitqueue_head(&ads131m08_data->wq);
+ 
+-   chunk_buf_list = devm_kzalloc(ads131m08_dev,sizeof(chunk_buf_t) * CHUNK_BUF_CNT, GFP_KERNEL);
+-   ready_list  = list_new(ads131m08_dev);
+-   free_list   = list_new(ads131m08_dev);
++   chunk_buf_list = devm_kzalloc(ads131m08_dev,
++                                 sizeof(chunk_buf_t) * CHUNK_BUF_CNT,
++                                 GFP_KERNEL);
++   if (!chunk_buf_list)
++      return -ENOMEM;
++
++   ready_list = list_new(ads131m08_dev);
++   free_list = list_new(ads131m08_dev);
+    active_list = list_new(ads131m08_dev);
+-   for(i=0;i<CHUNK_BUF_CNT;i++)
++   if (!ready_list || !free_list || !active_list)
++      return -ENOMEM;
++
++   for (i = 0; i < CHUNK_BUF_CNT; i++)
+    {
+       buf = &chunk_buf_list[i];
+-      init_chunk_buf(buf,DEFAULT_CHUNK_SZ);
++      init_chunk_buf(buf, DEFAULT_CHUNK_SZ);
+       ads131m08_data_return(buf);
+    }
++
+    return SUCCESS;
+ }
+ 
+ void ads131m08_data_exit(void)
+ {
+-   ads131m08_run_cmd(FALSE);
++   ads131m08_run_cmd(ADC_STOP);
+ }
+diff -ruN '--exclude=*.o' '--exclude=*.ko' '--exclude=*.cmd' '--exclude=*.mod' '--exclude=*.mod.c' '--exclude=Module.symvers' '--exclude=modules.order' /mnt/data/ads131m08_work/src/ads131m08_gpio.c /mnt/data/ads131m08_patched_src/ads131m08_gpio.c
+--- /mnt/data/ads131m08_work/src/ads131m08_gpio.c	2025-05-09 03:44:35.000000000 +0000
++++ /mnt/data/ads131m08_patched_src/ads131m08_gpio.c	2026-03-30 01:30:05.454884722 +0000
+@@ -16,74 +16,64 @@
+  */
+ #include <linux/init.h>
+ #include <linux/module.h>
+-#include <linux/gpio.h>
++#include <linux/gpio/consumer.h>
+ #include <linux/interrupt.h>
+-#include <linux/fs.h>
+-#include <linux/cdev.h>
+-#include <linux/device.h>
+-#include <linux/poll.h>
+-#include <linux/wait.h>
+-#include <linux/uaccess.h>
+ #include <linux/of.h>
+-#include <linux/of_gpio.h>
+-#include <linux/time.h>
+-#include <linux/ktime.h>
+ #include <linux/delay.h>
+-#include <linux/types.h>       // 기본 스케줄링 관련
+-#include <linux/sched.h>       // 기본 스케줄링 관련
+-#include <uapi/linux/sched/types.h>
+ 
+ #include "ads131m08.h"
+ ///////////////////////////////////////////////////////////////////////
+-//#define	CM5
+-#if defined (CM5)
+-#define GPIO_OFST       569
+-#else
+-#define GPIO_OFST       512
+-#endif
+-
+-#define	DRDY_PIN	(GPIO_OFST+18)
+-#define	RST_PIN		(GPIO_OFST+16)
+ static const char *pin_name = "ads131m08_drdy";
++static bool irq_registered;
+ 
+ void ads131m08_adc_rst(void)
+ {
+-   gpio_set_value(RST_PIN,1);
++   if (!ads131m08_data || !ads131m08_data->reset_gpiod)
++      return;
++
++   gpiod_set_value_cansleep(ads131m08_data->reset_gpiod, 1);
+    msleep(1);
+-   gpio_set_value(RST_PIN,0);
++   gpiod_set_value_cansleep(ads131m08_data->reset_gpiod, 0);
+ }
+ 
+ void ads131m08_adc_sync(void)
+ {
+-   gpio_set_value(RST_PIN,1);
++   if (!ads131m08_data || !ads131m08_data->reset_gpiod)
++      return;
++
++   gpiod_set_value_cansleep(ads131m08_data->reset_gpiod, 1);
+    udelay(1);
+-   gpio_set_value(RST_PIN,0);
++   gpiod_set_value_cansleep(ads131m08_data->reset_gpiod, 0);
+ }
+ 
+-static int irq_registered=false;
+-
+-void ads131m08_gpio_set_irq(ads131m08_data_t *data, 
++int ads131m08_gpio_set_irq(ads131m08_data_t *data,
+ 			irqreturn_t (*isr)(int irq, void *data),
+ 			irqreturn_t (*isr_thread)(int irq, void *data))
+ {
+-    int ret, irq_no;
+-    irq_no = data->gpio_irq_no;
++    int ret;
++
++    if (!data)
++        return -EINVAL;
++    if (irq_registered)
++        return 0;
++    if (data->gpio_irq_no <= 0)
++        return -EINVAL;
+ 
+-    // Threaded IRQ 요청 (ISR = NULL, Threaded handler만 사용)
+-    ret = request_threaded_irq(irq_no, isr, isr_thread,
++    ret = request_threaded_irq(data->gpio_irq_no, isr, isr_thread,
+                                IRQF_TRIGGER_FALLING | IRQF_ONESHOT,
+                                pin_name, data);
+     if (ret) {
+         pr_err("%s:request_threaded_irq failed %d\n", ads131m08_dev_name, ret);
+-        return;
++        return ret;
+     }
+ 
+     irq_registered = true;
++    return 0;
+ }
+ 
+ void ads131m08_gpio_clr_irq(ads131m08_data_t *data)
+ {
+-    if (irq_registered) {
++    if (irq_registered && data) {
+         free_irq(data->gpio_irq_no, data);
+         irq_registered = false;
+     }
+@@ -91,31 +81,46 @@
+ 
+ int ads131m08_gpio_init(ads131m08_data_t *data)
+ {
+-   int ret; //,irq_no;
++   int ret;
++   struct device *dev;
+ 
+-   //// Initialize DRDY PIN
+-   if((ret = gpio_request_one(DRDY_PIN,GPIOF_IN,pin_name))!=0)
++   if (!data || !data->spi)
++      return -EINVAL;
++
++   dev = &data->spi->dev;
++   irq_registered = false;
++
++   data->drdy_gpiod = devm_gpiod_get(dev, "drdy", GPIOD_IN);
++   if (IS_ERR(data->drdy_gpiod))
+    {
+-      pr_err("%s:gpio_request_one failed: %d\n",ads131m08_dev_name,ret);
+-      return FAIL;
++      ret = PTR_ERR(data->drdy_gpiod);
++      pr_err("%s: failed to get drdy-gpios (%d)\n", ads131m08_dev_name, ret);
++      return ret;
+    }
+-   data->gpio_irq_no = gpio_to_irq(DRDY_PIN);
+ 
++   data->reset_gpiod = devm_gpiod_get(dev, "reset", GPIOD_OUT_LOW);
++   if (IS_ERR(data->reset_gpiod))
++   {
++      ret = PTR_ERR(data->reset_gpiod);
++      pr_err("%s: failed to get reset-gpios (%d)\n", ads131m08_dev_name, ret);
++      return ret;
++   }
+ 
+-   pr_info("ads131m08:IRQ:%d\n",data->gpio_irq_no);
+-   // Initialize ADC Rst PIN
+-   if((ret=gpio_request_one(RST_PIN,GPIOF_OUT_INIT_LOW,"adc_rst"))<0)
++   ret = gpiod_to_irq(data->drdy_gpiod);
++   if (ret < 0)
+    {
+-      pr_err("%s:gpio_request failed GPIO %d\n",ads131m08_dev_name,RST_PIN);
+-      return FAIL;
++      pr_err("%s: gpiod_to_irq failed (%d)\n", ads131m08_dev_name, ret);
++      return ret;
+    }
++
++   data->gpio_irq_no = ret;
++   pr_info("ads131m08:IRQ:%d\n", data->gpio_irq_no);
+    return SUCCESS;
+ }
+ 
+ void ads131m08_gpio_exit(ads131m08_data_t *data)
+ {
+-   gpio_free(DRDY_PIN);
+-   gpio_free(RST_PIN);
++   ads131m08_gpio_clr_irq(data);
+ }
+ 
+ //////////////////////////////////////////////////////////////////////
+diff -ruN '--exclude=*.o' '--exclude=*.ko' '--exclude=*.cmd' '--exclude=*.mod' '--exclude=*.mod.c' '--exclude=Module.symvers' '--exclude=modules.order' /mnt/data/ads131m08_work/src/ads131m08_iface.c /mnt/data/ads131m08_patched_src/ads131m08_iface.c
+--- /mnt/data/ads131m08_work/src/ads131m08_iface.c	2025-04-30 09:06:37.000000000 +0000
++++ /mnt/data/ads131m08_patched_src/ads131m08_iface.c	2026-03-30 01:30:05.454310432 +0000
+@@ -28,6 +28,7 @@
+ #include <linux/timekeeping.h>
+ #include <linux/ktime.h>
+ #include <linux/atomic.h>
++#include <linux/errno.h>
+ 
+ #include "ads131m08.h"
+ #include "ads131m08_ioctl.h"
+@@ -36,27 +37,27 @@
+ static struct proc_dir_entry *proc_file;
+ static ssize_t proc_read(struct file *file, char __user *buf,size_t count,loff_t *ppos)
+ {
+-   int idx=0;
+-   //int ready_cnt,free_cnt,active_cnt;
++   int idx = 0;
+    char buffer[256];
+-   //ready_cnt = ads131m08_data_smpl_cnt(&free_cnt,&active_cnt);
+-   //idx  = sprintf(buffer,"cnt:%d,%d,%d\n",ready_cnt,free_cnt,active_cnt);
++
+    idx += ads131m08_data_buf_stat(&buffer[idx]);
+    return simple_read_from_buffer(buf, count, ppos, buffer, idx);
+ }
+ 
+-static const struct proc_ops proc_file_ops = 
++static const struct proc_ops proc_file_ops =
+ {
+     .proc_read = proc_read,
+ };
++
+ static int proc_file_init(void)
+ {
+-   proc_file = proc_create(ads131m08_dev_name,0444,NULL,&proc_file_ops);
+-   return proc_file?SUCCESS:FAIL;
++   proc_file = proc_create(ads131m08_dev_name, 0444, NULL, &proc_file_ops);
++   return proc_file ? SUCCESS : FAIL;
+ }
++
+ static void proc_file_exit(void)
+ {
+-   if(proc_file)
++   if (proc_file)
+       proc_remove(proc_file);
+ }
+ /////////////////////////////////////////////////////////////////
+@@ -69,117 +70,79 @@
+ 
+ static int ads131m08_open(struct inode *inode, struct file *file)
+ {
+-   if(atomic_read(&open_cnt)>0)
+-   {
++   if (atomic_cmpxchg(&open_cnt, 0, 1) != 0)
+       return -EBUSY;
+-   }
+-   atomic_inc(&open_cnt);
+-   //ads131m08_run_cmd(ADC_STOP);
++
++   file->private_data = ads131m08_data;
+    return 0;
+ }
++
+ static int ads131m08_release(struct inode *inode, struct file *file)
+ {
+    ads131m08_run_cmd(ADC_STOP);
+-   atomic_dec(&open_cnt);
+-   //ads131m08_adc_lock_release();
++   atomic_set(&open_cnt, 0);
+    return 0;
+ }
+ ////////////////////////////////////////////////////////////////////////////////
+-static int condition=0;
+ void ads131m08_iface_wakeup(void)
+ {
+-   condition=1;
+    wake_up_interruptible(&ads131m08_data->wq);
+ }
+ 
+ static ssize_t ads131m08_read(struct file *file, char __user *buf, size_t count, loff_t *offset)
+ {
+-   ssize_t idx=0,ret;
++   ssize_t idx = 0, ret;
++   size_t max_smpl_cnt;
+    chunk_buf_t *ready_buf;
+ 
+-   ret=wait_event_interruptible(ads131m08_data->wq,condition!=0);
+-   if(ret==-ERESTARTSYS)
+-   {
+-      pr_info("wait_event_interruptible error:%ld\n",ret);
+-      return -EINTR;
+-   }
+-   condition=0;
++   if (count < sizeof(smpl_data_t))
++      return -EINVAL;
+ 
+-   if((ready_buf=ads131m08_data_get())==NULL)
+-      return 0;
++   for (;;) {
++      ret = wait_event_interruptible(ads131m08_data->wq,
++                                     ads131m08_data_smpl_cnt(NULL, NULL) > 0 ||
++                                     ads131m08_run_stat() == ADC_STOP);
++      if (ret == -ERESTARTSYS)
++      {
++         pr_info("wait_event_interruptible error:%ld\n", ret);
++         return -EINTR;
++      }
++
++      ready_buf = ads131m08_data_get();
++      if (ready_buf)
++         break;
+ 
+-   count = count / sizeof(smpl_data_t);	// sample data count
++      if (ads131m08_run_stat() == ADC_STOP)
++         return 0;
++   }
++
++   max_smpl_cnt = count / sizeof(smpl_data_t);
+    BUF_LOCK(ready_buf);
+    idx = ready_buf->idx;
+    BUF_UNLOCK(ready_buf);
+-   ret = (count>idx?idx:count) * sizeof(smpl_data_t);
++   ret = min_t(size_t, max_smpl_cnt, idx) * sizeof(smpl_data_t);
+ 
+-   if(copy_to_user(buf,ready_buf->data,ret))
+-      ret=-EFAULT;
++   if (copy_to_user(buf, ready_buf->data, ret))
++      ret = -EFAULT;
+    ads131m08_data_return(ready_buf);
+    return ret;
+ }
++
+ static ssize_t ads131m08_write(struct file *file, const char __user *buf, size_t count, loff_t *offset)
+ {
+    return -EINVAL;
+ }
++
+ static unsigned int ads131m08_poll(struct file *file, poll_table *wait)
+ {
+    unsigned int mask = 0;
+-#if 0
+-   if(ads131m08_data_smpl_cnt(NULL,NULL)>0)
+-   {
+-      mask |= POLLIN | POLLRDNORM;
+-      return mask;
+-   }
+-#endif
+-   poll_wait(file,&ads131m08_data->wq,wait);
+-   if(ads131m08_data_smpl_cnt(NULL,NULL)>0)
++
++   poll_wait(file, &ads131m08_data->wq, wait);
++   if (ads131m08_data_smpl_cnt(NULL, NULL) > 0)
+       mask |= POLLIN | POLLRDNORM;
+    return mask;
+ }
+ 
+-#if 0
+-static int ioctl_reg(unsigned long arg,int read_reg,
+-	int (*reg_func)(uint8_t start_addr,int cnt,uint16_t *reg_data))
+-{
+-   int ret;
+-   struct ads_ioctl_reg *user_data;
+-   struct ads_ioctl_reg *kernel_data;
+-   size_t size,copy_sz;
+-   
+-   user_data = (struct ads_ioctl_reg *)arg;
+-   size = sizeof(*user_data) + user_data->reg_count * sizeof(uint16_t);
+-   if(!access_ok(user_data, size))
+-   {  
+-      return -EFAULT;
+-   }
+-   kernel_data = kzalloc(size,GFP_KERNEL);
+-   if(!kernel_data)
+-   {  
+-      return -ENOMEM;
+-   }
+-   copy_sz = read_reg?sizeof(struct ads_ioctl_reg):size;
+-   if(copy_from_user(kernel_data,user_data,copy_sz))
+-   {  
+-      kfree(kernel_data);
+-      return -EFAULT;
+-   }
+-   ret = reg_func(kernel_data->start_addr,kernel_data->reg_count, kernel_data->data);
+-   if(ret<0)
+-   {  
+-      kfree(kernel_data);
+-      return ret;
+-   }
+-   if(copy_to_user(user_data->data,kernel_data->data,kernel_data->reg_count * sizeof(uint16_t)))
+-   {  
+-      kfree(kernel_data);
+-      return -EFAULT;
+-   }
+-   kfree(kernel_data);
+-   return 0;
+-}
+-#else
+ static int ioctl_reg(unsigned long arg, int read_reg,
+ 	int (*reg_func)(uint8_t start_addr, int cnt, uint16_t *reg_data))
+ {
+@@ -188,13 +151,11 @@
+     struct ads_ioctl_reg *kernel_data;
+     size_t size, copy_sz;
+ 
+-    // 1. 사용자 공간에서 헤더 부분만 먼저 안전하게 복사
+     if (copy_from_user(&user_hdr, (void __user *)arg, sizeof(user_hdr))) {
+         pr_err("ioctl_reg: failed to copy header from user\n");
+         return -EFAULT;
+     }
+ 
+-    // 2. 헤더에서 데이터 개수를 추출 후 전체 크기 계산
+     if (user_hdr.reg_count == 0 || user_hdr.reg_count > 1024) {
+         pr_err("ioctl_reg: invalid reg_count = %u\n", user_hdr.reg_count);
+         return -EINVAL;
+@@ -202,20 +163,17 @@
+ 
+     size = sizeof(user_hdr) + user_hdr.reg_count * sizeof(uint16_t);
+ 
+-    // 3. 사용자 메모리 접근 가능 여부 확인
+     if (!access_ok((void __user *)arg, size)) {
+         pr_err("ioctl_reg: access_ok failed\n");
+         return -EFAULT;
+     }
+ 
+-    // 4. 커널 버퍼 동적 할당
+     kernel_data = kzalloc(size, GFP_KERNEL);
+     if (!kernel_data) {
+         pr_err("ioctl_reg: failed to allocate kernel_data\n");
+         return -ENOMEM;
+     }
+ 
+-    // 5. 전체 데이터 복사 (읽기일 경우는 헤더만 복사)
+     copy_sz = read_reg ? sizeof(user_hdr) : size;
+     if (copy_from_user(kernel_data, (void __user *)arg, copy_sz)) {
+         pr_err("ioctl_reg: failed to copy full data from user\n");
+@@ -223,14 +181,12 @@
+         return -EFAULT;
+     }
+ 
+-    // 6. 레지스터 read/write 함수 호출
+     ret = reg_func(kernel_data->start_addr, kernel_data->reg_count, kernel_data->data);
+     if (ret < 0) {
+         kfree(kernel_data);
+         return ret;
+     }
+ 
+-    // 7. 읽기 명령인 경우 결과를 사용자 공간에 복사
+     if (read_reg) {
+         if (copy_to_user(((struct ads_ioctl_reg __user *)arg)->data,
+                          kernel_data->data,
+@@ -241,25 +197,28 @@
+         }
+     }
+ 
+-    // 8. 메모리 해제 및 종료
+     kfree(kernel_data);
+     return 0;
+ }
+-#endif
+ 
+ static int ioctl_rreg(unsigned long arg)
+ {
+-   return ioctl_reg(arg,TRUE,ads131m08_reg_read);
++   return ioctl_reg(arg, 1, ads131m08_reg_read);
+ }
++
+ static int ioctl_wreg(unsigned long arg)
+ {
+-   return ioctl_reg(arg,FALSE,ads131m08_reg_write);
++   return ioctl_reg(arg, 0, ads131m08_reg_write);
+ }
++
+ static int ioctl_chunk_sz(unsigned long chunk_sz)
+ {
+-   if(chunk_sz>0)
++   if (ads131m08_run_stat() == ADC_RUN)
++      return -EBUSY;
++
++   if (chunk_sz > 0)
+    {
+-      pr_info("chunk_sz set:%lu\n",chunk_sz);
++      pr_info("chunk_sz set:%lu\n", chunk_sz);
+       ads131m08_data_resize_chunk_buf((int)chunk_sz);
+    }
+    return ads131m08_data_get_chunk_sz();
+@@ -268,50 +227,85 @@
+ static int cmd_reset(void)
+ {
+    int ret;
+-   ret=ads131m08_cmd_reset();
+-  //if(ads131m08_run_stat()==ADC_STOP)
+-  //    ads131m08_cmd_standby();
+-   return ret;
++
++   ret = ads131m08_cmd_reset();
++   if (ret < 0)
++      return ret;
++
++   return ads131m08_cmd_standby();
+ }
+ 
+ static int cmd_stat(unsigned long arg)
+ {
+    int stat = (int)arg;
+-   switch(stat)
++
++   switch (stat)
+    {
+-      case 0: 
+-      case 1:  ads131m08_run_cmd(stat); break;
+-      default: break;
++      case 0:
++      case 1:
++         return ads131m08_run_cmd(stat);
++      default:
++         break;
+    }
+    return ads131m08_run_stat();
+ }
+ 
+-static long ads131m08_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
++static bool ads131m08_ioctl_allowed_while_running(unsigned int cmd)
+ {
+-   int ret=0; // Success
+-#if 0
+-   if(ads131m08_adc_lock_cnt(10000)!=0)
++   switch (cmd)
+    {
+-      return FAIL;
++      case ADS_IOCTL_CMD_STANDBY:
++      case ADS_IOCTL_CMD_STAT:
++         return true;
++      default:
++         return false;
+    }
+-#endif
+-   //pr_info("%s:ioctl req cmd=%X\n",__func__,cmd);
+-   switch(cmd)
++}
++
++static long ads131m08_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
++{
++   int ret = -ENOTTY;
++
++   if (ads131m08_run_stat() == ADC_RUN && !ads131m08_ioctl_allowed_while_running(cmd))
++      return -EBUSY;
++
++   switch (cmd)
+    {
+-      case ADS_IOCTL_CMD_RESET:   ret=cmd_reset();             break;
+-      case ADS_IOCTL_CMD_STANDBY: ret=ads131m08_run_cmd(FALSE);break;
+-      case ADS_IOCTL_CMD_WAKEUP:  ret=ads131m08_run_cmd(TRUE); break;
+-      case ADS_IOCTL_CMD_LOCK:    ret=ads131m08_cmd_lock();    break;
+-      case ADS_IOCTL_CMD_UNLOCK:  ret=ads131m08_cmd_unlock();  break;
+-      case ADS_IOCTL_CMD_RREG:    ret=ioctl_rreg(arg);         break;
+-      case ADS_IOCTL_CMD_WREG:    ret=ioctl_wreg(arg);         break;
+-      case ADS_IOCTL_CMD_CHUNK_SZ:ret=ioctl_chunk_sz(arg);     break;
+-      case ADS_IOCTL_CMD_STAT:    ret=cmd_stat(arg);           break;
++      case ADS_IOCTL_CMD_RESET:
++         ret = cmd_reset();
++         break;
++      case ADS_IOCTL_CMD_STANDBY:
++         ret = ads131m08_run_cmd(ADC_STOP);
++         break;
++      case ADS_IOCTL_CMD_WAKEUP:
++         ret = ads131m08_run_cmd(ADC_RUN);
++         break;
++      case ADS_IOCTL_CMD_LOCK:
++         ret = ads131m08_cmd_lock();
++         break;
++      case ADS_IOCTL_CMD_UNLOCK:
++         ret = ads131m08_cmd_unlock();
++         break;
++      case ADS_IOCTL_CMD_RREG:
++         ret = ioctl_rreg(arg);
++         break;
++      case ADS_IOCTL_CMD_WREG:
++         ret = ioctl_wreg(arg);
++         break;
++      case ADS_IOCTL_CMD_CHUNK_SZ:
++         ret = ioctl_chunk_sz(arg);
++         break;
++      case ADS_IOCTL_CMD_STAT:
++         ret = cmd_stat(arg);
++         break;
++      default:
++         break;
+    }
+-   //ads131m08_adc_unlock();
++
+    return ret;
+ }
+-static struct file_operations ads131m08_fops = 
++
++static struct file_operations ads131m08_fops =
+ {
+    .owner = THIS_MODULE,
+    .open = ads131m08_open,
+@@ -321,54 +315,76 @@
+    .poll = ads131m08_poll,
+    .unlocked_ioctl = ads131m08_ioctl,
+ };
++
+ static int fops_init(ads131m08_data_t *data)
+ {
+-   int ret=FAIL;
++   int ret = FAIL;
+    struct cdev *cdev_ptr = &data->cdev;
+    dev_t dev_num;
+-   if((ret = alloc_chrdev_region(&dev_num, 0, 1, ads131m08_driver_name))<0)
++   struct device *dev_ret;
++
++   ret = alloc_chrdev_region(&dev_num, 0, 1, ads131m08_driver_name);
++   if (ret < 0)
+    {
+-      pr_err("%s:Failed to allocate char device region\n",ads131m08_dev_name);
++      pr_err("%s:Failed to allocate char device region\n", ads131m08_dev_name);
+       return ret;
+    }
++
+    data->dev_num = dev_num;
+-   cdev_init(cdev_ptr,&ads131m08_fops);
++   cdev_init(cdev_ptr, &ads131m08_fops);
+    cdev_ptr->owner = THIS_MODULE;
+-   //pr_info("%s:%d,dev_num=%d\n",__func__,__LINE__,dev_num);
+-   if((ret=cdev_add(cdev_ptr, dev_num, 1))<0)
++
++   ret = cdev_add(cdev_ptr, dev_num, 1);
++   if (ret < 0)
+    {
+-      pr_err("%s:Failed to add cdev\n",ads131m08_dev_name);
++      pr_err("%s:Failed to add cdev\n", ads131m08_dev_name);
+       unregister_chrdev_region(dev_num, 1);
++      return ret;
+    }
++
+    data->cl = class_create(ads131m08_class_name);
+-   if(IS_ERR(data->cl))
++   if (IS_ERR(data->cl))
+    {
+-      pr_err("%s:Failed to create class\n",__func__);
++      pr_err("%s:Failed to create class\n", __func__);
++      ret = PTR_ERR(data->cl);
+       cdev_del(cdev_ptr);
+-      unregister_chrdev_region(dev_num,1);
+-      return FAIL;
++      unregister_chrdev_region(dev_num, 1);
++      return ret;
+    }
+-   device_create(data->cl,NULL,dev_num,NULL,ads131m08_dev_name);
+-   ret = SUCCESS;
+-   return ret;
++
++   dev_ret = device_create(data->cl, NULL, dev_num, NULL, ads131m08_dev_name);
++   if (IS_ERR(dev_ret))
++   {
++      ret = PTR_ERR(dev_ret);
++      class_destroy(data->cl);
++      cdev_del(cdev_ptr);
++      unregister_chrdev_region(dev_num, 1);
++      return ret;
++   }
++
++   return SUCCESS;
+ }
++
+ static void fops_exit(ads131m08_data_t *data)
+ {
+-   device_destroy(data->cl,data->dev_num);
++   if (!data || !data->cl)
++      return;
++
++   device_destroy(data->cl, data->dev_num);
+    class_destroy(data->cl);
+    cdev_del(&data->cdev);
+    unregister_chrdev_region(data->dev_num, 1);
+-   return;
+ }
+ 
+ /////////////////////////////////////////////////////////////////
+ int ads131m08_iface_init(ads131m08_data_t *data)
+ {
+-   if(proc_file_init()<0)
+-   {
++   atomic_set(&open_cnt, 0);
++
++   if (proc_file_init() < 0)
+       return FAIL;
+-   }
+-   if(fops_init(data)<0)
++
++   if (fops_init(data) < 0)
+    {
+       proc_file_exit();
+       return FAIL;
+diff -ruN '--exclude=*.o' '--exclude=*.ko' '--exclude=*.cmd' '--exclude=*.mod' '--exclude=*.mod.c' '--exclude=Module.symvers' '--exclude=modules.order' /mnt/data/ads131m08_work/src/ads131m08_main.c /mnt/data/ads131m08_patched_src/ads131m08_main.c
+--- /mnt/data/ads131m08_work/src/ads131m08_main.c	2025-04-22 00:08:13.000000000 +0000
++++ /mnt/data/ads131m08_patched_src/ads131m08_main.c	2026-03-30 01:30:05.454637471 +0000
+@@ -33,60 +33,67 @@
+ #include "ads131m08.h"
+ ///////////////////////////////////////////////////////////////////////
+ #define	DRIVER_NAME	"spi-ads131m08"
++#define DEFAULT_SPI_MAX_SPEED_HZ 15000000U
+ //////////////////////////////////////////////////////////////////////
+ const char *ads131m08_dev_name = "ads131m08";
+ const char *ads131m08_class_name = "ads131m08_class";
+ const char *ads131m08_driver_name = DRIVER_NAME;
+ 
+-/////////////////////////////////////////////////////////////////////////////
+-#if 0
+-static void print_spi(struct spi_device *spi)
+-{
+-   struct spi_controller *ctlr;
+-
+-   ctlr = spi->controller;
+-   pr_info("bus_num:      %d\n",ctlr->bus_num);
+-   pr_info("num_chip:     %d\n",ctlr->num_chipselect);
+-   pr_info("max_speed_hz: %d\n",spi->max_speed_hz);
+-   pr_info("spi mode:     %d\n",spi->mode);
+-   pr_info("bits_per_word:%d\n",spi->bits_per_word);
+-   pr_info("irq:          %d\n",spi->irq);
+-   pr_info("modalias:     %s\n",spi->modalias);
+-}
+-#endif
+ static int ads131m08_probe(struct spi_device *spi)
+ {
+    int ret;
++
+    pr_info("ADS131M08 Probe\n");
+ 
+-   if((ret=ads131m08_data_init(spi))<0)
++   ret = ads131m08_data_init(spi);
++   if (ret < 0)
+       return ret;
+ 
+-   spi->mode = 0x1; // SPI_MODE_1
+-   spi->max_speed_hz = 15000000UL; // 15MHz
++   spi->mode = SPI_MODE_1;
++   if (!spi->max_speed_hz)
++      spi->max_speed_hz = DEFAULT_SPI_MAX_SPEED_HZ;
+ 
+-   if(spi_setup(spi)!=0)
++   ret = spi_setup(spi);
++   if (ret)
+    {
+-      pr_info("spi_setup failed\n");
+-      return FAIL;
++      pr_err("%s: spi_setup failed (%d)\n", ads131m08_dev_name, ret);
++      return ret;
+    }
+-   //print_spi(spi);
+ 
+-   spi_set_drvdata(spi,ads131m08_data);
++   spi_set_drvdata(spi, ads131m08_data);
+    ads131m08_data->spi = spi;
+ 
+-   ads131m08_spi_init(spi);
+-   //ads131m08_gpio_init(ads131m08_data,ads131m08_data_isr);
+-   ads131m08_gpio_init(ads131m08_data);
+-   ads131m08_iface_init(ads131m08_data);
+-   pr_info("%s: module loaded\n",ads131m08_dev_name);
++   ret = ads131m08_spi_init(spi);
++   if (ret < 0)
++      return ret;
++
++   ret = ads131m08_gpio_init(ads131m08_data);
++   if (ret < 0)
++      goto err_spi;
++
++   ret = ads131m08_iface_init(ads131m08_data);
++   if (ret < 0)
++      goto err_gpio;
++
++   pr_info("%s: module loaded\n", ads131m08_dev_name);
+ 
+-   /// ADC Rst & standby
+    ads131m08_adc_rst();
+-   ads131m08_cmd_standby();
+-   //ads131m08_data_cleanup();
+-   //ads131m08_cmd_wakeup();
++   ret = ads131m08_cmd_standby();
++   if (ret < 0)
++   {
++      pr_err("%s: failed to put ADC into standby (%d)\n", ads131m08_dev_name, ret);
++      goto err_iface;
++   }
++
+    return SUCCESS;
++
++err_iface:
++   ads131m08_iface_exit(ads131m08_data);
++err_gpio:
++   ads131m08_gpio_exit(ads131m08_data);
++err_spi:
++   ads131m08_spi_exit();
++   return ret;
+ }
+ 
+ static void ads131m08_remove(struct spi_device *spi)
+@@ -94,8 +101,8 @@
+    ads131m08_iface_exit(ads131m08_data);
+    ads131m08_data_exit();
+    ads131m08_gpio_exit(ads131m08_data);
+-   pr_info("%s: module removed\n",ads131m08_dev_name );
+-   return;
++   ads131m08_spi_exit();
++   pr_info("%s: module removed\n", ads131m08_dev_name);
+ }
+ //////////////////////////////////////////////////////////////
+ static const struct of_device_id ads131m08_of_match[] = {
+diff -ruN '--exclude=*.o' '--exclude=*.ko' '--exclude=*.cmd' '--exclude=*.mod' '--exclude=*.mod.c' '--exclude=Module.symvers' '--exclude=modules.order' /mnt/data/ads131m08_work/src/ads131m08_rpi5.dts /mnt/data/ads131m08_patched_src/ads131m08_rpi5.dts
+--- /mnt/data/ads131m08_work/src/ads131m08_rpi5.dts	2025-11-05 06:36:57.000000000 +0000
++++ /mnt/data/ads131m08_patched_src/ads131m08_rpi5.dts	2026-03-30 01:30:05.455851849 +0000
+@@ -1,6 +1,8 @@
+ /dts-v1/;
+ /plugin/;
+ 
++#include <dt-bindings/gpio/gpio.h>
++
+ / {
+     compatible = "brcm,bcm2712";
+ 
+@@ -16,6 +18,8 @@
+                 compatible = "ti,ads131m08";
+                 reg = <0>;
+                 spi-max-frequency = <15000000>;
++                drdy-gpios = <&gpio 18 GPIO_ACTIVE_HIGH>;
++                reset-gpios = <&gpio 16 GPIO_ACTIVE_HIGH>;
+                 status = "okay";
+             };
+         };
+diff -ruN '--exclude=*.o' '--exclude=*.ko' '--exclude=*.cmd' '--exclude=*.mod' '--exclude=*.mod.c' '--exclude=Module.symvers' '--exclude=modules.order' /mnt/data/ads131m08_work/src/ads131m08_spi.c /mnt/data/ads131m08_patched_src/ads131m08_spi.c
+--- /mnt/data/ads131m08_work/src/ads131m08_spi.c	2025-04-22 05:27:42.000000000 +0000
++++ /mnt/data/ads131m08_patched_src/ads131m08_spi.c	2026-03-30 01:30:05.455230780 +0000
+@@ -22,6 +22,7 @@
+ #include <linux/delay.h>
+ #include <linux/dma-mapping.h>
+ #include <linux/completion.h>
++#include <linux/mutex.h>
+ 
+ #include "ads131m08.h"
+ ///////////////////////////////////////////////////////////////////////
+@@ -32,6 +33,8 @@
+ //////////////////////////////////////////////////////////////////////
+ static list_t	*xfer_list;
+ static struct spi_device *spi_hdlr;
++static DEFINE_MUTEX(spi_io_lock);
++
+ typedef struct
+ {
+    list_elm_t head;
+@@ -41,17 +44,14 @@
+    struct spi_transfer spi_xfer;
+ } xfer_t;
+ 
+-#define	XFER_BUF_NUM	3
++#define	XFER_BUF_NUM	8
+ static xfer_t *xfer_new(void)
+ {
+-   xfer_t *xfer = (xfer_t *)kzalloc(sizeof(xfer_t),GFP_KERNEL);
+-#if 0
+-   xfer->spi_xfer.rx_buf = xfer->rx_buf;
+-   xfer->spi_xfer.tx_buf = xfer->tx_buf;
+-   spi_message_init(&xfer->spi_msg);
+-   spi_message_add_tail(&xfer->spi_xfer,&xfer->spi_msg);
+-   xfer->spi_msg.complete = xfer_complete;
+-#endif
++   xfer_t *xfer = (xfer_t *)kzalloc(sizeof(xfer_t), GFP_KERNEL);
++   if (!xfer)
++      return NULL;
++
++   spin_lock_init(&xfer->head.lock);
+    return xfer;
+ }
+ 
+@@ -60,29 +60,42 @@
+    xfer_t *xfer = (xfer_t *)args;
+    kfree(xfer);
+ }
++
+ static void xfer_buf_free(void)
+ {
+-   list_cleanup(xfer_list,free_xfer);
++   if (xfer_list)
++      list_cleanup(xfer_list, free_xfer);
+ }
+ 
+-static void xfer_buf_init(void)
++static int xfer_buf_init(void)
+ {
+    int i;
+    xfer_t *xfer;
++
+    xfer_list = list_new(ads131m08_dev);
+-   for(i=0;i<XFER_BUF_NUM;i++)
++   if (!xfer_list)
++      return -ENOMEM;
++
++   for (i = 0; i < XFER_BUF_NUM; i++)
+    {
+       xfer = xfer_new();
+-      list_append(xfer_list,xfer);
++      if (!xfer)
++         return -ENOMEM;
++      list_append(xfer_list, xfer);
+    }
++
++   return 0;
+ }
++
+ static xfer_t *get_xfer_buf(void)
+ {
+    return list_fetch(xfer_list);
+ }
++
+ static void return_xfer_buf(xfer_t *xfer)
+ {
+-   list_append(xfer_list,xfer);
++   if (xfer)
++      list_append(xfer_list, xfer);
+ }
+ 
+ /////////////////////////////////////////////////////////////////////////////
+@@ -109,6 +122,7 @@
+    }
+    return idx;
+ }
++
+ static int frame2word(uint8_t *frame,void *buf,int cnt)
+ {
+    int idx=0,i;
+@@ -118,10 +132,11 @@
+    {
+       ret[i]  = frame[idx++]<<8;
+       ret[i] |= frame[idx++];
+-      idx++;    // Skip LSB
++      idx++;
+    }
+    return idx;
+ }
++
+ static int frame2long(uint8_t *frame,void *buf,int cnt)
+ {
+    int idx=0,i;
+@@ -144,121 +159,156 @@
+ static int adc_trx(uint16_t cmd, uint16_t *tx,int tx_cnt, void *rx,int rx_cnt,
+ 		int (*frame_conv)(uint8_t *frame,void *buf,int cnt),uint16_t *status)
+ {
+-   int xfer_cnt=0,xfer_len,idx,ret;
+-   uint8_t *rx_buf,*tx_buf;
+-   uint16_t tmp16;
++   int xfer_cnt = 0, xfer_len, idx, ret;
++   uint8_t *rx_buf, *tx_buf;
++   uint16_t tmp16 = 0;
+    xfer_t *xfer;
+-   struct spi_transfer spi_xfer;
++   struct spi_transfer spi_xfer = { 0 };
++
++   if (!spi_hdlr)
++      return -ENODEV;
+ 
+-   xfer_cnt = tx_cnt>rx_cnt?tx_cnt:rx_cnt;
+-   if(xfer_cnt==0)
++   xfer_cnt = tx_cnt > rx_cnt ? tx_cnt : rx_cnt;
++   if (xfer_cnt == 0)
+       xfer_cnt = 1;
+    else
+       xfer_cnt += 2;
+    xfer_len = xfer_cnt * BYTE_PER_WORD;
+ 
+-   /// SPI transaction
+-   /////////////////////////////////////
+-   if((xfer = get_xfer_buf())==NULL)
++   if (xfer_len > MAX_BUF_SZ)
++      return -EINVAL;
++
++   xfer = get_xfer_buf();
++   if (xfer == NULL)
+    {
+-      pr_err("%s: %s,no available xfer buf\n",ads131m08_dev_name,__func__);
+-      return FAIL;
++      pr_err("%s: %s,no available xfer buf\n", ads131m08_dev_name, __func__);
++      return -ENOMEM;
+    }
+-   spi_xfer.len = xfer_len;
+-   spi_xfer.rx_buf = rx_buf;
+-   spi_xfer.tx_buf = tx_buf = xfer->tx_buf;
+-   spi_xfer.rx_buf = rx_buf = xfer->rx_buf;
+ 
+-   memset(tx_buf,0,xfer_len);
+-   idx = word2frame(&cmd,tx_buf,1);
+-   /// Write register
+-   if(tx_cnt>0)
+-      idx += word2frame(tx,&tx_buf[idx],tx_cnt);
++   tx_buf = xfer->tx_buf;
++   rx_buf = xfer->rx_buf;
++   memset(tx_buf, 0, xfer_len);
++   memset(rx_buf, 0, xfer_len);
+ 
++   idx = word2frame(&cmd, tx_buf, 1);
++   if (tx_cnt > 0)
++      idx += word2frame(tx, &tx_buf[idx], tx_cnt);
+ 
+-   if((ret=spi_sync_transfer(spi_hdlr,&spi_xfer,1))<0)
+-      return ret;
+-   idx = frame2word(rx_buf,&tmp16,1);
+-   if(status)
+-      *status = tmp16;
+-   if(rx && frame_conv)
++   spi_xfer.len = xfer_len;
++   spi_xfer.tx_buf = tx_buf;
++   spi_xfer.rx_buf = rx_buf;
++
++   mutex_lock(&spi_io_lock);
++   ret = spi_sync_transfer(spi_hdlr, &spi_xfer, 1);
++   mutex_unlock(&spi_io_lock);
++   if (ret < 0)
+    {
+-      frame_conv(&rx_buf[idx],rx,rx_cnt);
++      return_xfer_buf(xfer);
++      return ret;
+    }
+-   return_xfer_buf(xfer);
+-   /////////////////////////////////////
+ 
++   idx = frame2word(rx_buf, &tmp16, 1);
++   if (status)
++      *status = tmp16;
++   if (rx && frame_conv)
++      frame_conv(&rx_buf[idx], rx, rx_cnt);
++
++   return_xfer_buf(xfer);
+    return ret;
+ }
+ 
+ static int read_stat(uint16_t *status)
+ {
+-   return adc_trx(CMD_NULL,NULL,0,NULL,0,NULL,status);
++   return adc_trx(CMD_NULL, NULL, 0, NULL, 0, NULL, status);
+ }
++
+ int ads131m08_read_stat(uint16_t *status)
+ {
+-   uint16_t ret;
+-   ret=read_stat(status);
++   int ret;
++
++   ret = read_stat(status);
+    return ret;
+ }
+-/// Read SPI Frames
++
+ int ads131m08_reg_read(uint8_t start_addr,int cnt,uint16_t *ret_reg)
+ {
+    int ret;
+    uint16_t status,cmd;
++
+    cmd = (CMD_RREG | start_addr<<7 | (cnt-1));
+-   adc_trx(cmd,NULL,0,NULL,ADC_CH_NUM,NULL,NULL);
+-   ret = adc_trx(CMD_NULL,NULL,0,ret_reg,cnt,frame2word,&status);
+-   if(cnt==1)
++   ret = adc_trx(cmd, NULL, 0, NULL, ADC_CH_NUM, NULL, NULL);
++   if (ret < 0)
++      return ret;
++
++   ret = adc_trx(CMD_NULL, NULL, 0, ret_reg, cnt, frame2word, &status);
++   if (ret < 0)
++      return ret;
++   if (cnt == 1)
+       *ret_reg = status;
+-   return ret;  // Result
++   return ret;
+ }
++
+ int ads131m08_reg_write(uint8_t start_addr,int cnt,uint16_t *reg_val)
+ {
+    int ret;
+    uint16_t cmd,status;
++
+    cmd = (CMD_WREG | start_addr<<7 | (cnt-1));
+-   ret=adc_trx(cmd,reg_val,cnt,NULL,0,NULL,NULL);
+-   ret=read_stat(&status);
++   ret = adc_trx(cmd, reg_val, cnt, NULL, 0, NULL, NULL);
++   if (ret < 0)
++      return ret;
++
++   ret = read_stat(&status);
+    return ret;
+ }
+ ////////////////////////////////////////////////////////////////
+ #define	DATA_CNT		(ADC_CH_NUM + 2)
+ #define	DATA_LEN		(DATA_CNT * BYTE_PER_WORD)
++
+ static void xfer_complete(void *arg)
+ {
+-   int idx=0,ready=false;
++   int idx = 0;
++   bool ready = false;
+    chunk_buf_t *active_buf = (chunk_buf_t *)arg;
+    xfer_t *xfer;
+    uint8_t *rx_buf;
+    smpl_data_t *new_data;
+    uint16_t tmp16;
++
+    xfer = active_buf->xfer;
++   if (!xfer)
++      return;
++
+    rx_buf = xfer->rx_buf;
+    new_data = ads131m08_smpl_data_get(active_buf);
+-   idx = frame2word(rx_buf,&tmp16,1);
+-   frame2long(&rx_buf[idx],new_data->data,ADC_CH_NUM);
++   if (!new_data)
++   {
++      return_xfer_buf(xfer);
++      active_buf->xfer = NULL;
++      ads131m08_chunk_buf_active(active_buf);
++      return;
++   }
++
++   idx = frame2word(rx_buf, &tmp16, 1);
++   frame2long(&rx_buf[idx], new_data->data, ADC_CH_NUM);
+    return_xfer_buf(xfer);
++   active_buf->xfer = NULL;
+ 
+    BUF_LOCK(active_buf);
+    active_buf->idx++;
+-   if(active_buf->idx>=active_buf->chunk_sz)
++   if(active_buf->idx >= active_buf->chunk_sz)
+    {
+       active_buf->stat = BUF_STAT_READY;
+-      ready=true;
++      ready = true;
+    }
+    BUF_UNLOCK(active_buf);
+-   if(ready)
+-   {
++
++   if (ready)
+       ads131m08_chunk_buf_ready(active_buf);
+-   }
+    else
+-   {
+       ads131m08_chunk_buf_active(active_buf);
+-   }
+ }
+ 
+-//#define	ASYNC_XFER
+ int ads131m08_read_data(chunk_buf_t *active_buf)
+ {
+    struct spi_message  *spi_msg;
+@@ -266,72 +316,112 @@
+    xfer_t *xfer;
+    int ret;
+ 
+-   if((xfer = get_xfer_buf())==NULL || spi_hdlr==NULL)
++   if (!active_buf)
++      return -EINVAL;
++   if (!spi_hdlr)
++      return -ENODEV;
++
++   xfer = get_xfer_buf();
++   if (xfer == NULL)
+    {
+-      pr_err("%s:%s,no available xfer buffer or invalid spi_hdlr\n",ads131m08_dev_name,__func__);
+-      return FAIL;
++      pr_err("%s:%s,no available xfer buffer\n", ads131m08_dev_name, __func__);
++      return -ENOMEM;
+    }
++
+    spi_xfer = &xfer->spi_xfer;
+    spi_msg  = &xfer->spi_msg;
++   memset(spi_xfer, 0, sizeof(*spi_xfer));
++   memset(xfer->tx_buf, 0, DATA_LEN);
++   memset(xfer->rx_buf, 0, DATA_LEN);
++
+    spi_xfer->len = DATA_LEN;
+-   spi_xfer->tx_buf = NULL;
++   spi_xfer->tx_buf = xfer->tx_buf;
+    spi_xfer->rx_buf = xfer->rx_buf;
+ 
+-   memset(xfer->tx_buf,0,DATA_LEN + 4);
+-
+    active_buf->xfer = xfer;
+-#if defined (ASYNC_XFER)
+    spi_message_init(spi_msg);
+    spi_message_add_tail(spi_xfer, spi_msg);
+-   spi_msg->complete = xfer_complete;
+-   spi_msg->context = active_buf;
+-   ///
+-   if((ret=spi_async(spi_hdlr,spi_msg))!=0)
++
++   mutex_lock(&spi_io_lock);
++   ret = spi_sync_transfer(spi_hdlr, spi_xfer, 1);
++   mutex_unlock(&spi_io_lock);
++   if (ret < 0)
+    {
+-      pr_err("%s:%s,SPI xfer failed (%d).\n",ads131m08_dev_name,__func__,ret);
+-      return FAIL;
++      active_buf->xfer = NULL;
++      return_xfer_buf(xfer);
++      return ret;
+    }
+-#else
+-   if((ret=spi_sync_transfer(spi_hdlr,spi_xfer,1))<0)
+-      return FAIL;
++
+    xfer_complete(active_buf);
+-#endif
+    return SUCCESS;
+ }
+ 
++int ads131m08_read_data_discard(void)
++{
++   uint8_t tx_buf[DATA_LEN] = { 0 };
++   uint8_t rx_buf[DATA_LEN] = { 0 };
++   struct spi_transfer spi_xfer = { 0 };
++   int ret;
++
++   if (!spi_hdlr)
++      return -ENODEV;
++
++   spi_xfer.len = DATA_LEN;
++   spi_xfer.tx_buf = tx_buf;
++   spi_xfer.rx_buf = rx_buf;
++
++   mutex_lock(&spi_io_lock);
++   ret = spi_sync_transfer(spi_hdlr, &spi_xfer, 1);
++   mutex_unlock(&spi_io_lock);
++   return ret;
++}
++
+ /////////////////////////////////////////////////////////////////////
+ static int cmd_strobe(uint16_t cmd,uint16_t *data,int cnt,int wait_usec)
+ {
+    int ret;
+    uint16_t stat;
+-   ret=adc_trx(cmd,data,cnt,NULL,0,NULL,&stat);
++
++   ret = adc_trx(cmd, data, cnt, NULL, 0, NULL, &stat);
++   if (ret < 0)
++      return ret;
++   if (wait_usec > 0)
++      udelay(wait_usec);
+    return ret;
+ }
++
+ int ads131m08_cmd_standby(void)
+ {
+-   return cmd_strobe(CMD_STANDBY,NULL,0,0);
++   return cmd_strobe(CMD_STANDBY, NULL, 0, 0);
+ }
++
+ int ads131m08_cmd_wakeup(void)
+ {
+-   return cmd_strobe(CMD_WAKEUP,NULL,0,0);
++   return cmd_strobe(CMD_WAKEUP, NULL, 0, 0);
+ }
++
+ int ads131m08_cmd_reset(void)
+ {
+    int ret;
+-   uint16_t stat,data[7];
+-   memset(data,0,sizeof(uint16_t) * 7);
+-   ret=cmd_strobe(CMD_RESET,data,7,1);
+-   udelay(10);
+-   ret=read_stat(&stat);
++   uint16_t stat, data[8];
++
++   memset(data, 0, sizeof(data));
++   ret = cmd_strobe(CMD_RESET, data, 8, 10);
++   if (ret < 0)
++      return ret;
++
++   ret = read_stat(&stat);
+    return ret;
+ }
++
+ int ads131m08_cmd_lock(void)
+ {
+-   return cmd_strobe(CMD_LOCK,NULL,0,0);
++   return cmd_strobe(CMD_LOCK, NULL, 0, 0);
+ }
++
+ int ads131m08_cmd_unlock(void)
+ {
+-   return cmd_strobe(CMD_UNLOCK,NULL,0,0);
++   return cmd_strobe(CMD_UNLOCK, NULL, 0, 0);
+ }
+ /////////////////////////////////////////////////////////////////////
+ 
+@@ -339,9 +429,17 @@
+ {
+    spi_hdlr = NULL;
+    xfer_buf_free();
++   xfer_list = NULL;
+ }
+-void ads131m08_spi_init(struct spi_device *spi)
++
++int ads131m08_spi_init(struct spi_device *spi)
+ {
+-   xfer_buf_init();
++   int ret;
++
++   ret = xfer_buf_init();
++   if (ret < 0)
++      return ret;
++
+    spi_hdlr = spi;
++   return 0;
+ }
+diff -ruN '--exclude=*.o' '--exclude=*.ko' '--exclude=*.cmd' '--exclude=*.mod' '--exclude=*.mod.c' '--exclude=Module.symvers' '--exclude=modules.order' /mnt/data/ads131m08_work/src/list.c /mnt/data/ads131m08_patched_src/list.c
+--- /mnt/data/ads131m08_work/src/list.c	2025-04-22 00:08:13.000000000 +0000
++++ /mnt/data/ads131m08_patched_src/list.c	2026-03-30 01:30:05.453428032 +0000
+@@ -12,43 +12,27 @@
+ #include "list.h"
+ #include "ads131m08.h"
+ 
+-/***************************************************
+- * MACRO
+- */
+-
+-/***************************************************
+- * FUNCTION DEFINITIONS
+- */
+-
+-/*********************************************************************
+- * @fn      list_append
+- *
+- * @brief   Append list element to list
+- *
+- * @param   list_t *head
+- * @param   list_elm_t *elm
+- *
+- * @return  None
+- */
+ void list_append(list_t *list,void *elm)
+ {
+    list_elm_t *elem;
+-   if(list==NULL || elm==NULL)
+-	return;
++
++   if (!list || !elm)
++      return;
++
+    elem = (list_elm_t *)elm;
+    elem->parent = list;
+-  
+-   LIST_LOCK(list); 
+-   if(list->head==NULL)
++   elem->next = NULL;
++
++   LIST_LOCK(list);
++   if (list->head == NULL)
+    {
+-      elem->prev = elem->next = NULL;
++      elem->prev = NULL;
+       list->head = list->tail = elem;
+    }
+    else
+    {
+       elem->prev = list->tail;
+       elem->prev->next = elem;
+-      elem->next = NULL;
+       list->tail = elem;
+    }
+    list->count++;
+@@ -57,41 +41,37 @@
+ 
+ void list_insert(list_t *list,void *prev_elem,void *elem)
+ {
+-   list_elm_t *prev_elm,*elm;
+-   if(list==NULL || elem==NULL)
++   list_elm_t *prev_elm, *elm;
++
++   if (!list || !elem)
+       return;
++
+    prev_elm = (list_elm_t *)prev_elem;
+    elm = (list_elm_t *)elem;
+    elm->parent = list;
++
+    LIST_LOCK(list);
+-   if(list->head==NULL)
++   if (list->head == NULL)
+    {
+       elm->prev = elm->next = NULL;
+       list->head = list->tail = elm;
+    }
+-   else 
++   else if (prev_elm == NULL)
+    {
+-      if(prev_elm==NULL)
+-      {
+-	 elm->prev = NULL;
+-	 elm->next = list->head;
+-	 list->head->prev = elm;
+-	 list->head = elm;
+-      }
++      elm->prev = NULL;
++      elm->next = list->head;
++      list->head->prev = elm;
++      list->head = elm;
++   }
++   else
++   {
++      elm->prev = prev_elm;
++      elm->next = prev_elm->next;
++      prev_elm->next = elm;
++      if (elm->next == NULL)
++         list->tail = elm;
+       else
+-      {
+-	 elm->prev = prev_elm;
+-	 elm->next = prev_elm->next;
+-	 prev_elm->next = elm;
+-	 if(elm->next==NULL)
+-         {
+-	    list->tail = elm;
+-         }
+-         else
+-         {
+-            elm->next->prev = elm;
+-         }
+-      }
++         elm->next->prev = elm;
+    }
+    list->count++;
+    LIST_UNLOCK(list);
+@@ -99,72 +79,72 @@
+ 
+ void list_insert_sort(list_t *list,void *new,int (*comp_func)(void *next,void *new))
+ {
+-   void *prev,*next,*last;
++   void *prev, *next, *last;
+ 
+-   prev=NULL;
++   if (!list || !new || !comp_func)
++      return;
+ 
+-   if((last=list_get_last_elm) && comp_func(last,new)==FALSE)
++   prev = NULL;
++   last = list_get_last_elm(list);
++   if (last && !comp_func(last, new))
+    {
+-      list_append(list,new);
++      list_append(list, new);
+       return;
+    }
+ 
+-   while((next=list_iter(list,prev)))
++   while ((next = list_iter(list, prev)))
+    {
+-      if(comp_func(next,new))
++      if (comp_func(next, new))
+       {
+-         list_insert(list,prev,new);
++         list_insert(list, prev, new);
+          return;
+       }
+       prev = next;
+    }
+-   list_append(list,new);
++
++   list_append(list, new);
+ }
+ 
+ void *list_fetch(list_t *list)
+ {
+    list_elm_t *ret;
+-   if(list==NULL)
++
++   if (!list)
+       return NULL;
++
+    LIST_LOCK(list);
+    ret = list->head;
+-   if(ret)
++   if (ret)
+    {
+       list->head = ret->next;
+-      if(list->head)
+-	  list->head->prev = NULL;
++      if (list->head)
++         list->head->prev = NULL;
+       else
+-	 list->tail = NULL;
++         list->tail = NULL;
++
+       list->count--;
+       ret->parent = NULL;
++      ret->prev = NULL;
++      ret->next = NULL;
+    }
+    LIST_UNLOCK(list);
+    return ret;
+ }
+ 
+-
+-
+-/*********************************************************************
+- * @fn      search_list
+- *
+- * @brief   Search list element
+- *
+- * @param   list_t *head
+- * @param   list_elm_t *elm
+- *
+- * @return  None
+- */
+ void *list_search(list_t *list,void *arg,
+-			int comp_func(void *arg,void *elm))
++				int comp_func(void *arg,void *elm))
+ {
+    list_elm_t *next;
+ 
++   if (!list || !comp_func)
++      return NULL;
++
+    LIST_LOCK(list);
+    next = list->head;
+-   while(next)
++   while (next)
+    {
+-      if(comp_func(arg,next)==TRUE)
+-	  break;
++      if (comp_func(arg, next))
++         break;
+       next = next->next;
+    }
+    LIST_UNLOCK(list);
+@@ -174,179 +154,153 @@
+ void *list_get_idx(list_t *list,int idx)
+ {
+    int cnt;
+-   list_elm_t *next=NULL;
++   list_elm_t *next = NULL;
++
++   if (!list || idx < 0)
++      return NULL;
++
+    LIST_LOCK(list);
+-   if(idx<list->count)
++   if (idx < list->count)
+    {
+       next = list->head;
+       cnt = idx;
+-      while(cnt)
+-      {
+-	 next = next->next;
+-	 cnt--;
+-      }
++      while (cnt-- && next)
++         next = next->next;
+    }
+    LIST_UNLOCK(list);
+    return next;
+ }
+ 
+-/*********************************************************************
+- * @fn      list_iter
+- *
+- * @brief   List iteration
+- *
+- * @param   list_t *list
+- * @param   list_elm_t *prev
+- *
+- * @return  list_elm_t *next
+- */
+ void *list_iter(list_t *list,void *prev)
+ {
+-   if(prev==NULL)
+-	return list->head;
++   if (!list)
++      return NULL;
++   if (prev == NULL)
++      return list->head;
+    return ((list_elm_t *)prev)->next;
+ }
+ 
+ void *list_get_last_elm(list_t *list)
+ {
++   if (!list)
++      return NULL;
+    return list->tail;
+ }
+ 
+ void *list_get_first_elm(list_t *list)
+ {
++   if (!list)
++      return NULL;
+    return list->head;
+ }
+ 
+-/*********************************************************************
+- * @fn      delete_list
+- *
+- * @brief   Delete list element
+- *
+- * @param   list_elm_t *elm
+- *
+- * @return  None
+- */
+ void list_del_elm(void *elem,int free_elm)
+ {
+    list_t *list;
+    list_elm_t *elm = (list_elm_t *)elem;
+-   if(elm==NULL)
++
++   if (!elm)
+       return;
++
+    list = elm->parent;
+-   if(list==NULL)
++   if (!list)
+    {
+-      kfree(elm);
++      if (free_elm)
++         kfree(elm);
+       return;
+    }
+ 
+    LIST_LOCK(list);
+-   if(elm->prev)
+-   {
++   if (elm->prev)
+       elm->prev->next = elm->next;
+-   }
+-   else // it's head element
+-   {
++   else
+       list->head = elm->next;
+-   }
+-   if(elm->next)
+-   {
++
++   if (elm->next)
+       elm->next->prev = elm->prev;
+-   }
+-   else  // it's tail element
+-   {
++   else
+       list->tail = elm->prev;
+-   }
+-   elm->prev = elm->next = NULL;
++
++   elm->prev = NULL;
++   elm->next = NULL;
++   elm->parent = NULL;
+    list->count--;
+    LIST_UNLOCK(list);
+ 
+-   if(free_elm)
+-     kfree(elm);
+-   return;
++   if (free_elm)
++      kfree(elm);
+ }
+ 
+ void list_iter_do(list_t *list,void (*action)(const void *args))
+ {
+-   list_elm_t *elm,*next;
++   list_elm_t *elm, *next;
++
++   if (!list || !action)
++      return;
+ 
+    LIST_LOCK(list);
+    elm = list->head;
+-   while(elm)
++   while (elm)
+    {
+       next = elm->next;
+       action(elm);
+       elm = next;
+    }
+-   list->head = list->tail = 0;
++   list->head = NULL;
++   list->tail = NULL;
++   list->count = 0;
+    LIST_UNLOCK(list);
+-   return;
+ }
+ 
+-/*********************************************************************
+- * @fn      delete_all_list
+- *
+- * @brief   Delete all list element
+- *
+- * @param   list_t *list
+- *
+- * @return  None
+- */
+ void list_cleanup(list_t *list,void (*free_elm)(const void *args))
+ {
+    list_elm_t *elm;
+    void (*free_func)(const void *args);
+-   free_func = (free_elm?free_elm:kfree);
+-   while((elm=list_fetch(list)))
+-   {
++
++   if (!list)
++      return;
++
++   free_func = free_elm ? free_elm : kfree;
++   while ((elm = list_fetch(list)))
+       free_func(elm);
+-   }
+-   return;
+ }
+ 
+-/*********************************************************************
+- * @fn      alloc_list_elm
+- *
+- * @brief   Allocation list element
+- *
+- * @param   int size
+- *
+- * @return  void (*arg)
+- */
+ void *list_alloc_elm(int size)
+ {
+    list_elm_t *elm;
+ 
+-   elm = (list_elm_t *)kzalloc(size,GFP_KERNEL);
+-   if(elm==NULL)
+-	return NULL;
+-   elm->prev = elm->next = NULL;
++   elm = (list_elm_t *)kzalloc(size, GFP_KERNEL);
++   if (!elm)
++      return NULL;
++
++   elm->prev = NULL;
++   elm->next = NULL;
+    elm->parent = NULL;
+-   //mutex_init(&elm->lock);
+    spin_lock_init(&elm->lock);
+    return elm;
+ }
+ 
+ void list_lock(list_t *list)
+ {
+-   if(list==NULL)
+-	return;
+-   //mutex_lock(&list->lock);
+-   spin_lock_irqsave(&list->lock,list->flags);
++   if (!list)
++      return;
++   spin_lock(&list->lock);
+ }
+ 
+ void list_unlock(list_t *list)
+ {
+-   if(list==NULL)
+-	return;
+-   //mutex_unlock(&list->lock);
+-   spin_unlock_irqrestore(&list->lock,list->flags);
++   if (!list)
++      return;
++   spin_unlock(&list->lock);
+ }
+ 
+ int list_get_cnt(list_t *list)
+ {
+    int ret;
+-   if(!list)
++
++   if (!list)
+       return 0;
++
+    LIST_LOCK(list);
+    ret = list->count;
+    LIST_UNLOCK(list);
+@@ -356,21 +310,27 @@
+ list_t *list_new(struct device *dev)
+ {
+    list_t *new;
+-   new = (list_t *)devm_kzalloc(dev,sizeof(list_t),GFP_KERNEL);
+-   //mutex_init(&new->lock);
++
++   new = (list_t *)devm_kzalloc(dev, sizeof(list_t), GFP_KERNEL);
++   if (!new)
++      return NULL;
++
+    spin_lock_init(&new->lock);
++   new->count = 0;
++   new->head = NULL;
++   new->tail = NULL;
+    return new;
+ }
+ 
+ void list_print(list_t *list)
+ {
+-   void *node=NULL;
++   void *node = NULL;
+    char print_buf[512];
+-   int idx=0;
+-   idx=sprintf(print_buf,"LIST<%p,%d>:",list,list_get_cnt(list));
+-   while((node=list_iter(list,node)))
+-   {
+-      idx+=sprintf(&print_buf[idx],"[%p]=>",node);
+-   }
+-   pr_info("%s\n",print_buf);
++   int idx = 0;
++
++   idx = snprintf(print_buf, sizeof(print_buf), "LIST<%p,%d>:", list, list_get_cnt(list));
++   while ((node = list_iter(list, node)) && idx < sizeof(print_buf))
++      idx += scnprintf(&print_buf[idx], sizeof(print_buf) - idx, "[%p]=>", node);
++
++   pr_info("%s\n", print_buf);
+ }
+diff -ruN '--exclude=*.o' '--exclude=*.ko' '--exclude=*.cmd' '--exclude=*.mod' '--exclude=*.mod.c' '--exclude=Module.symvers' '--exclude=modules.order' /mnt/data/ads131m08_work/src/list.h /mnt/data/ads131m08_patched_src/list.h
+--- /mnt/data/ads131m08_work/src/list.h	2025-04-22 00:08:13.000000000 +0000
++++ /mnt/data/ads131m08_patched_src/list.h	2026-03-30 01:30:05.453078337 +0000
+@@ -32,7 +32,6 @@
+    int count;
+    list_elm_t	*head;
+    list_elm_t	*tail;
+-   unsigned long flags;
+    spinlock_t    lock;
+ };
+ 
+@@ -41,9 +40,8 @@
+    list_t 	*parent;
+    list_elm_t	*prev;
+    list_elm_t	*next;
+-   unsigned long flags;
+    spinlock_t    lock;
+-}; 
++};
+ 
+ /*****************************************
+  * CONSTANT DEFINE
+@@ -52,17 +50,11 @@
+ /*****************************************
+  * MACRO DEFINE
+  */
+-#define	LIST_COUNT(listp)	(list.count)
+-
+-//#define	LIST_LOCK(listp)	mutex_lock(&((listp)->lock))
+-//#define	LIST_UNLOCK(listp)	mutex_unlock(&((listp)->lock))
+-#define	LIST_LOCK(listp)	spin_lock_irqsave(&((listp)->lock),listp->flags)
+-#define	LIST_UNLOCK(listp)	spin_unlock_irqrestore(&((listp)->lock),listp->flags)
+-
+-//#define	LIST_ELM_LOCK(elmp)	mutex_lock(&((list_elm_t *)elmp)->lock)
+-//#define	LIST_ELM_UNLOCK(elmp)	mutex_unlock(&((list_elm_t *)elmp)->lock)
+-#define	LIST_ELM_LOCK(elmp)	spin_lock_irqsave(&((list_elm_t *)elmp)->lock,((list_elm_t *)elmp)->flags)
+-#define	LIST_ELM_UNLOCK(elmp)	spin_unlock_irqsave(&((list_elm_t *)elmp)->lock,((list_elm_t *)elmp)->flags)
++#define	LIST_COUNT(listp)	((listp)->count)
++#define	LIST_LOCK(listp)	spin_lock(&((listp)->lock))
++#define	LIST_UNLOCK(listp)	spin_unlock(&((listp)->lock))
++#define	LIST_ELM_LOCK(elmp)	spin_lock(&((list_elm_t *)(elmp))->lock)
++#define	LIST_ELM_UNLOCK(elmp)	spin_unlock(&((list_elm_t *)(elmp))->lock)
+ 
+ #define	list_foreach(list_ptr,elm)	while((elm=list_iter(list_ptr,elm)))
+ 
+diff -ruN '--exclude=*.o' '--exclude=*.ko' '--exclude=*.cmd' '--exclude=*.mod' '--exclude=*.mod.c' '--exclude=Module.symvers' '--exclude=modules.order' /mnt/data/ads131m08_work/src/spi-ads131m08-overlay.dts /mnt/data/ads131m08_patched_src/spi-ads131m08-overlay.dts
+--- /mnt/data/ads131m08_work/src/spi-ads131m08-overlay.dts	2025-04-22 00:08:13.000000000 +0000
++++ /mnt/data/ads131m08_patched_src/spi-ads131m08-overlay.dts	2026-03-30 01:30:05.456201569 +0000
+@@ -1,7 +1,10 @@
+ /dts-v1/;
+ /plugin/;
++
++#include <dt-bindings/gpio/gpio.h>
++
+ / {
+-    compatible = "brcm,bcm2711";
++    compatible = "brcm,bcm2711", "brcm,bcm2712";
+ 
+     fragment@0 {
+         target = <&spi5>;
+@@ -12,24 +15,11 @@
+             ads131m08: adc@0 {
+                 compatible = "ti,ads131m08";
+                 reg = <0>;
+-                spi-max-frequency = <1000000>; // 1 MHz
+-                interrupt-parent = <&gpio>;
+-                interrupts = <12 2>; // GPIO 12, active high
++                spi-max-frequency = <15000000>;
++                drdy-gpios = <&gpio 18 GPIO_ACTIVE_HIGH>;
++                reset-gpios = <&gpio 16 GPIO_ACTIVE_HIGH>;
+                 status = "okay";
+             };
+         };
+     };
+-
+-    fragment@1 {
+-        target = <&gpio>;
+-        __overlay__ {
+-            adc_cs: adc_cs {
+-                gpio-hog;
+-                gpios = <&gpio 12 0>;
+-                output-high;
+-                line-name = "adc_cs";
+-            };
+-        };
+-    };
+ };
+-
+Binary files /mnt/data/ads131m08_work/src/test_program/print_ioctl_cmd and /mnt/data/ads131m08_patched_src/test_program/print_ioctl_cmd differ
+Binary files /mnt/data/ads131m08_work/src/test_program/test and /mnt/data/ads131m08_patched_src/test_program/test differ

@@ -1,0 +1,14 @@
+make: Entering directory '/usr/src/linux-headers-6.12.69+deb13-amd64'
+  CC [M]  /mnt/data/ads131m08_patched_src/ads131m08_main.o
+  CC [M]  /mnt/data/ads131m08_patched_src/ads131m08_iface.o
+  CC [M]  /mnt/data/ads131m08_patched_src/ads131m08_gpio.o
+  CC [M]  /mnt/data/ads131m08_patched_src/ads131m08_spi.o
+  CC [M]  /mnt/data/ads131m08_patched_src/ads131m08_data.o
+  CC [M]  /mnt/data/ads131m08_patched_src/list.o
+  LD [M]  /mnt/data/ads131m08_patched_src/ads131m08.o
+  MODPOST /mnt/data/ads131m08_patched_src/Module.symvers
+  CC [M]  /mnt/data/ads131m08_patched_src/ads131m08.mod.o
+  CC [M]  /mnt/data/ads131m08_patched_src/.module-common.o
+  LD [M]  /mnt/data/ads131m08_patched_src/ads131m08.ko
+  BTF [M] /mnt/data/ads131m08_patched_src/ads131m08.ko
+make: Leaving directory '/usr/src/linux-headers-6.12.69+deb13-amd64'

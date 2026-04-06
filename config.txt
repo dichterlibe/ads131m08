@@ -1,0 +1,4 @@
+
+dtparam=watchdog=on
+dtoverlay=spi5-1cs,cs0_spidev=off
+dtoverlay=spi-ads131m08-overlay

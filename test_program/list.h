@@ -1,0 +1,97 @@
+/*********************************************************************
+  Filename:       list.h
+  Revised:        Date: 2006/1/9
+  Revision:       Revision: 0.1
+
+  Description:
+          - define list functions
+
+          ENUStech,Inc.
+  Notes:
+
+  Copyright (c) 2006 by ENUStech, Inc., All Rights Reserved.
+
+*********************************************************************/
+
+#ifndef LIST_H
+#define LIST_H
+
+/*****************************************
+ * INCLUDES
+ */
+#include <pthread.h>
+
+/*****************************************
+ * TYPE DEFINES
+ */
+typedef struct LIST_STRUCT list_t;
+typedef struct LIST_ELM_STRUCT list_elm_t;
+
+struct LIST_STRUCT
+{
+   int count;
+   list_elm_t	*head;
+   list_elm_t	*tail;
+   pthread_mutex_t lock;
+};
+
+struct LIST_ELM_STRUCT
+{
+   list_t 	*parent;
+   list_elm_t	*prev;
+   list_elm_t	*next;
+   pthread_mutex_t lock;
+}; 
+
+/*****************************************
+ * CONSTANT DEFINE
+ */
+
+/*****************************************
+ * MACRO DEFINE
+ */
+#define	DECLARE_LIST(list)	list_t list={.lock=PTHREAD_MUTEX_INITIALIZER,}
+#define	LIST_COUNT(listp)	(list.count)
+
+#define	LIST_LOCK(listp)	pthread_mutex_lock(&((listp)->lock))
+#define	LIST_UNLOCK(listp)	pthread_mutex_unlock(&((listp)->lock))
+
+#define	LIST_ELM_LOCK(elmp)	pthread_mutex_lock(&((list_elm_t *)elmp)->lock)
+#define	LIST_ELM_UNLOCK(elmp)	pthread_mutex_unlock(&((list_elm_t *)elmp)->lock)
+
+#define	list_foreach(list_ptr,elm)	while((elm=list_iter(list_ptr,elm)))
+
+/*****************************************
+ * EXTERNAL FUNCTIONS
+ */
+extern void list_append(list_t *list,void *elm);
+extern void list_insert(list_t *list,void *prev_elm,void *elm);
+extern void list_insert_sort(list_t *list,void *elem,int (*comp_func)(void *next,void *new));
+
+extern void *list_search(list_t *list,void *arg,
+				int comp_func(void *arg,void *elm));
+extern void *list_iter(list_t *list,void *prev);
+extern void *list_get_last_elm(list_t *list);
+extern void *list_get_first_elm(list_t *list);
+
+extern void list_del_elm(void *elem,int free_elm);
+extern void list_cleanup(list_t *list,void (*free_elm)(void *elm));
+extern void list_purge(list_t *list,void (*free_elm)(void *elm));
+extern void list_iter_do(list_t *list,void (*action)(void *elm));
+extern void *list_alloc_elm(int size);
+
+extern void list_lock(list_t *list);
+extern void list_unlock(list_t *list);
+
+extern int list_get_cnt(list_t *list);
+extern list_t *list_new(void);
+
+extern void *list_fetch(list_t *list);
+extern void *list_get_idx(list_t *list,int idx);
+
+extern void list_print(list_t *list);
+
+/*****************************************
+ * MACROS DEFINE
+ */
+#endif

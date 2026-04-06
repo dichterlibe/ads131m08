@@ -1,0 +1,23 @@
+/dts-v1/;
+/plugin/;
+
+/ {
+    compatible = "brcm,bcm2711", "brcm,bcm2712";
+
+    fragment@0 {
+        target = <&spi5>;
+        __overlay__ {
+            #address-cells = <1>;
+            #size-cells = <0>;
+            status = "okay";
+            ads131m08: adc@0 {
+                compatible = "ti,ads131m08";
+                reg = <0>;
+                spi-max-frequency = <25000000>;
+                drdy-gpios = <&gpio 18 0>;
+                reset-gpios = <&gpio 16 0>;
+                status = "okay";
+            };
+        };
+    };
+};
