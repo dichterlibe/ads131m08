@@ -453,18 +453,7 @@ This driver is a good fit for:
 
 ## License
 
-Add the appropriate license statement here to match the actual source code in your repository.
-
-Examples:
-
-- GPL-2.0-only
 - GPL-2.0-or-later
-- Dual BSD/GPL
-- Proprietary internal use
-
-Use the exact license already declared in the driver source headers.
-
----
 
 ## Maintainer Notes
 
